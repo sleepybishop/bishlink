@@ -1,0 +1,15 @@
+[submodule "deps/pathflow"]
+	path = deps/pathflow
+	url = https://github.com/sleepybishop/pathflow
+[submodule "deps/quicly"]
+	path = deps/quicly
+	url = https://github.com/sleepybishop/quicly
+	branch = multipath
+[submodule "deps/nanors"]
+	path = deps/nanors
+	url = https://github.com/sleepybishop/nanors
+	branch = master
+[submodule "deps/nanorq"]
+	path = deps/nanorq
+	url = https://github.com/sleepybishop/nanorq
+	branch = stable

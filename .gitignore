@@ -1,0 +1,32 @@
+# Compiled binaries and intermediate build files
+bishlink-host
+bishlink-client
+bishlink-inputd
+bishlink-videod
+bishlink-audiod
+bishlink-tund
+t/00util/test_fec
+t/00util/test_transport
+t/00util/test_uds
+t/00util/test_audio
+t/00util/test_inputd
+t/00util/test_videod
+t/00util/test_audiod
+t/00util/test_tund
+t/assets/
+*.o
+*.a
+
+# CMake build directories
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+!/Makefile
+/build/
+
+# IDE files
+.vscode/
+.idea/
+
+# Documentation
+doc/
