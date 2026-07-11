@@ -104,6 +104,17 @@ typedef struct {
   uint16_t symbol_size;
 } sent_object_cache_t;
 
+#define FEC_CACHE_SIZE 8
+
+typedef struct {
+  fec_type_t type;
+  size_t data_symbols;
+  size_t parity_symbols;
+  size_t symbol_size;
+  fec_t *fec;
+  uint64_t last_used_ns;
+} fec_cache_entry_t;
+
 struct transport_t {
   transport_callback_t callback;
   void *user_data;
@@ -155,7 +166,50 @@ struct transport_t {
   /* ifmon integration */
   ifmon_watcher_t ifmon_w;
   int ifmon_pipe[2];
+
+  /* fec cache for zero-allocation hot path */
+  fec_cache_entry_t fec_cache[FEC_CACHE_SIZE];
 };
+
+/* fetch or create a cached FEC context matching parameters */
+static fec_t *get_cached_fec(transport_t *t, fec_type_t type,
+                             size_t data_symbols, size_t parity_symbols,
+                             size_t symbol_size) {
+  uint64_t now = get_time_ns();
+  int lru_idx = 0;
+  uint64_t min_time = -1;
+
+  for (int i = 0; i < FEC_CACHE_SIZE; i++) {
+    if (t->fec_cache[i].fec && t->fec_cache[i].type == type &&
+        t->fec_cache[i].data_symbols == data_symbols &&
+        t->fec_cache[i].parity_symbols == parity_symbols &&
+        t->fec_cache[i].symbol_size == symbol_size) {
+      t->fec_cache[i].last_used_ns = now;
+      return t->fec_cache[i].fec;
+    }
+    if (t->fec_cache[i].last_used_ns < min_time) {
+      min_time = t->fec_cache[i].last_used_ns;
+      lru_idx = i;
+    }
+  }
+
+  /* cache miss, evict the lru entry */
+  if (t->fec_cache[lru_idx].fec) {
+    fec_destroy(t->fec_cache[lru_idx].fec);
+    t->fec_cache[lru_idx].fec = NULL;
+  }
+
+  fec_t *fec = fec_create_ex(type, data_symbols, parity_symbols, symbol_size);
+  if (fec) {
+    t->fec_cache[lru_idx].type = type;
+    t->fec_cache[lru_idx].data_symbols = data_symbols;
+    t->fec_cache[lru_idx].parity_symbols = parity_symbols;
+    t->fec_cache[lru_idx].symbol_size = symbol_size;
+    t->fec_cache[lru_idx].fec = fec;
+    t->fec_cache[lru_idx].last_used_ns = now;
+  }
+  return fec;
+}
 
 /* Helper to map a link/socket index to the QUIC path index by matching local
  * IPs */
@@ -551,12 +605,11 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
           }
 
           if (parity_symbols > 0) {
-            fec_t *fec = fec_create_ex(FEC_RAPTORQ, data_symbols,
-                                       parity_symbols, symbol_size);
+            fec_t *fec = get_cached_fec(t, FEC_RAPTORQ, data_symbols,
+                                        parity_symbols, symbol_size);
             if (fec) {
               fec_encode(fec, (const uint8_t *const *)data_blocks,
                          parity_blocks);
-              fec_destroy(fec);
             }
           }
 
@@ -976,8 +1029,8 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
         fec_type_t fec_type = (resolved_track.type == MOQ_TRACK_DATA)
                                   ? FEC_RAPTORQ
                                   : FEC_REED_SOLOMON;
-        fec_t *fec =
-            fec_create_ex(fec_type, data_symbols, parity_symbols, symbol_size);
+        fec_t *fec = get_cached_fec(t, fec_type, data_symbols, parity_symbols,
+                                    symbol_size);
         if (fec) {
           bool missing[256];
           memset(missing, 0, sizeof(missing));
@@ -985,7 +1038,6 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
             missing[i] = !asm_slot->received_mask[i];
           }
           success = fec_decode(fec, asm_slot->buffers, missing);
-          fec_destroy(fec);
         }
       }
     }
@@ -1328,6 +1380,12 @@ void transport_destroy(transport_t *t) {
   for (size_t i = 0; i < SENT_CACHE_SIZE; i++) {
     if (t->sent_cache[i].data) {
       free(t->sent_cache[i].data);
+    }
+  }
+
+  for (size_t i = 0; i < FEC_CACHE_SIZE; i++) {
+    if (t->fec_cache[i].fec) {
+      fec_destroy(t->fec_cache[i].fec);
     }
   }
 
@@ -1933,10 +1991,9 @@ bool transport_publish(transport_t *t, const moq_object_t *obj) {
 
   if (parity_symbols > 0) {
     fec_t *fec =
-        fec_create_ex(fec_type, data_symbols, parity_symbols, symbol_size);
+        get_cached_fec(t, fec_type, data_symbols, parity_symbols, symbol_size);
     if (fec) {
       fec_encode(fec, (const uint8_t *const *)data_blocks, parity_blocks);
-      fec_destroy(fec);
     }
   }
 
