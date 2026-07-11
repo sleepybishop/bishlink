@@ -78,6 +78,15 @@ static void on_transport_event(void *user_data,
              (int)event->object.size, (char *)event->object.data);
     }
     break;
+  case TRANSPORT_EVENT_OBJECT_LOST:
+    printf("client: object lost for track %d, requesting keyframe\n",
+           event->track_id.type);
+    transport_request_keyframe(ctx->transport, event->track_id);
+    break;
+  case TRANSPORT_EVENT_KEYFRAME_REQUEST:
+  case TRANSPORT_EVENT_AUTH:
+    /* server side events */
+    break;
   }
 }
 

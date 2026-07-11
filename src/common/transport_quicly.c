@@ -451,6 +451,11 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
       memcpy(&payload_size, input.base + 1, 4);
       payload_size = be32toh(payload_size);
 
+      if (payload_size > 1048576) {
+        quicly_close(conn->quic, 0, "protocol error: payload too large");
+        break;
+      }
+
       if (input.len < 5 + payload_size)
         break;
 
@@ -510,6 +515,11 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
       uint32_t payload_size;
       memcpy(&payload_size, input.base + 2, 4);
       payload_size = be32toh(payload_size);
+
+      if (payload_size > 1048576) {
+        quicly_close(conn->quic, 0, "protocol error: payload too large");
+        break;
+      }
 
       if (input.len < 6 + (size_t)payload_size)
         break;
@@ -943,6 +953,20 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
     asm_slot = &tconn->assemblers[tconn->assembler_index];
     tconn->assembler_index =
         (tconn->assembler_index + 1) % ASSEMBLER_CACHE_SIZE;
+
+    if (asm_slot->total_symbols > 0 && !asm_slot->decoded) {
+      moq_track_id_t resolved_track;
+      if (find_subscription_by_alias(tconn, asm_slot->track_id,
+                                     &resolved_track) == 0) {
+        transport_event_t ev = {.type = TRANSPORT_EVENT_OBJECT_LOST,
+                                .conn = tconn,
+                                .track_id = resolved_track,
+                                .object = {.track_id = resolved_track,
+                                           .group_id = asm_slot->group_id,
+                                           .object_id = asm_slot->object_id}};
+        tconn->transport->callback(tconn->transport->user_data, &ev);
+      }
+    }
 
     if (!asm_slot->buffers || asm_slot->capacity_symbols < total_symbols ||
         asm_slot->capacity_symbol_size < symbol_size) {

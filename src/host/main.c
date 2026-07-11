@@ -96,6 +96,13 @@ static void on_transport_event(void *user_data,
                     event->object.size, event->object.priority);
     }
     break;
+  case TRANSPORT_EVENT_AUTH_COMPLETE:
+    /* only relevant for clients */
+    break;
+  case TRANSPORT_EVENT_OBJECT_LOST:
+    printf("host: received object lost for track type %d\n",
+           event->track_id.type);
+    break;
   }
 }
 

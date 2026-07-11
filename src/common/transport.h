@@ -51,12 +51,14 @@ typedef struct {
 typedef enum {
   TRANSPORT_EVENT_CONNECTED,
   TRANSPORT_EVENT_DISCONNECTED,
-  TRANSPORT_EVENT_SUBSCRIBE,       /* client subscribed to a track */
-  TRANSPORT_EVENT_UNSUBSCRIBE,     /* client unsubscribed from a track */
-  TRANSPORT_EVENT_OBJECT,          /* received a track object */
-  TRANSPORT_EVENT_AUTH,            /* server received authentication token */
-  TRANSPORT_EVENT_AUTH_COMPLETE,   /* client received authentication response */
-  TRANSPORT_EVENT_KEYFRAME_REQUEST /* client requested a video keyframe */
+  TRANSPORT_EVENT_SUBSCRIBE,     /* client subscribed to a track */
+  TRANSPORT_EVENT_UNSUBSCRIBE,   /* client unsubscribed from a track */
+  TRANSPORT_EVENT_OBJECT,        /* received a track object */
+  TRANSPORT_EVENT_AUTH,          /* server received authentication token */
+  TRANSPORT_EVENT_AUTH_COMPLETE, /* client received authentication response */
+  TRANSPORT_EVENT_KEYFRAME_REQUEST, /* client requested a video keyframe */
+  TRANSPORT_EVENT_OBJECT_LOST       /* packet group failed FEC recovery and was
+                                       evicted */
 } transport_event_type_t;
 
 typedef struct {
