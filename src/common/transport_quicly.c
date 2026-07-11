@@ -1265,7 +1265,7 @@ transport_t *transport_create(const transport_config_t *config) {
   t->quic_ctx.stream_open = &t->stream_open;
   t->quic_ctx.receive_datagram_frame = &t->receive_datagram;
 
-  t->quic_ctx.path_scheduler = &quicly_default_path_scheduler;
+  t->quic_ctx.path_scheduler = &quicly_round_robin_path_scheduler;
 
   t->quic_ctx.initcwnd_packets = 100;
   t->quic_ctx.transport_params.max_datagram_frame_size = 1500;
@@ -1334,10 +1334,11 @@ transport_t *transport_create(const transport_config_t *config) {
     transport_conn_t *conn = calloc(1, sizeof(transport_conn_t));
     conn->transport = t;
 
-    int ret = quicly_connect(&conn->quic, &t->quic_ctx, config->remote_hosts[0],
-                             (struct sockaddr *)&t->remote_addrs[0], NULL,
-                             &t->next_cid, ptls_iovec_init(NULL, 0), NULL, NULL,
-                             NULL);
+    int ret =
+        quicly_connect(&conn->quic, &t->quic_ctx, config->remote_hosts[0],
+                       (struct sockaddr *)&t->remote_addrs[0],
+                       (struct sockaddr *)&t->local_addrs[0], &t->next_cid,
+                       ptls_iovec_init(NULL, 0), NULL, NULL, NULL);
     if (ret != 0)
       return NULL;
 
