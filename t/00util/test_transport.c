@@ -1,0 +1,269 @@
+/* test_transport.c */
+
+#include "transport.h"
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+typedef struct {
+  bool connected;
+  bool subscribed;
+  bool object_received;
+  uint8_t received_data[100];
+  size_t received_size;
+  transport_t *transport;
+} test_state_t;
+
+static void on_server_event(void *user_data, const transport_event_t *event) {
+  test_state_t *state = user_data;
+  switch (event->type) {
+  case TRANSPORT_EVENT_CONNECTED:
+    state->connected = true;
+    break;
+  case TRANSPORT_EVENT_SUBSCRIBE:
+    if (event->track_id.type == MOQ_TRACK_TEXT &&
+        strcmp(event->track_id.name, "catalog") == 0) {
+      /* serialize catalog manifest */
+      const char *manifest = "video:fec:video_track\ndata:fec:data_track\n";
+      moq_object_t cat_obj = {.track_id = event->track_id,
+                              .group_id = 0,
+                              .object_id = 0,
+                              .data = (const uint8_t *)manifest,
+                              .size = strlen(manifest),
+                              .is_keyframe = true};
+      transport_publish(state->transport, &cat_obj);
+    } else if (event->track_id.type == MOQ_TRACK_VIDEO &&
+               strcmp(event->track_id.name, "video_track") == 0) {
+      state->subscribed = true;
+    }
+    break;
+  case TRANSPORT_EVENT_AUTH:
+    transport_respond_auth(state->transport, event->conn, true);
+    break;
+  default:
+    break;
+  }
+}
+
+static void on_client_event(void *user_data, const transport_event_t *event) {
+  test_state_t *state = user_data;
+  switch (event->type) {
+  case TRANSPORT_EVENT_CONNECTED:
+    transport_send_auth(state->transport, event->conn,
+                        (const uint8_t *)"secret_token_123",
+                        strlen("secret_token_123"));
+    break;
+  case TRANSPORT_EVENT_AUTH_COMPLETE:
+    if (event->auth.success) {
+      state->connected = true;
+    }
+    break;
+  case TRANSPORT_EVENT_OBJECT:
+    if (event->track_id.type == MOQ_TRACK_TEXT &&
+        strcmp(event->track_id.name, "catalog") == 0) {
+      char manifest[256];
+      if (event->object.size < sizeof(manifest)) {
+        memcpy(manifest, event->object.data, event->object.size);
+        manifest[event->object.size] = '\0';
+
+        char *line = manifest;
+        while (*line) {
+          size_t line_len = strcspn(line, "\n");
+          if (line_len > 0) {
+            char saved_char = line[line_len];
+            line[line_len] = '\0';
+
+            char *type_str = line;
+            size_t type_len = strcspn(type_str, ":");
+            if (type_str[type_len] == ':') {
+              type_str[type_len] = '\0';
+
+              char *flags_str = type_str + type_len + 1;
+              size_t flags_len = strcspn(flags_str, ":");
+              if (flags_str[flags_len] == ':') {
+                flags_str[flags_len] = '\0';
+
+                char *name_str = flags_str + flags_len + 1;
+
+                moq_track_id_t disc_track = {0};
+                if (strcmp(type_str, "video") == 0) {
+                  disc_track.type = MOQ_TRACK_VIDEO;
+                } else if (strcmp(type_str, "data") == 0) {
+                  disc_track.type = MOQ_TRACK_DATA;
+                } else if (strcmp(type_str, "text") == 0) {
+                  disc_track.type = MOQ_TRACK_TEXT;
+                }
+
+                if (strcmp(flags_str, "fec") == 0) {
+                  disc_track.flags = MOQ_TRACK_FLAG_FEC_ENABLED;
+                } else if (strcmp(flags_str, "reliable") == 0) {
+                  disc_track.flags = MOQ_TRACK_FLAG_RELIABLE;
+                }
+
+                strcpy(disc_track.name, name_str);
+                printf("client parsed discovered track: type=%s, name=%s\n",
+                       type_str, name_str);
+                transport_subscribe(state->transport, disc_track);
+              }
+            }
+            line[line_len] = saved_char;
+          }
+          line += line_len;
+          if (*line == '\n') {
+            line++;
+          }
+        }
+      }
+    } else if (event->track_id.type == MOQ_TRACK_VIDEO &&
+               strcmp(event->track_id.name, "video_track") == 0) {
+      state->object_received = true;
+      state->received_size = event->object.size;
+      if (event->object.size < sizeof(state->received_data)) {
+        memcpy(state->received_data, event->object.data, event->object.size);
+        state->received_data[event->object.size] = '\0';
+      }
+    }
+    break;
+  default:
+    break;
+  }
+}
+
+int main(void) {
+  test_state_t server_state = {0};
+  test_state_t client_state = {0};
+
+  /* create server transport config */
+  transport_config_t server_cfg = {0};
+  server_cfg.bind_hosts[0] = "127.0.0.1";
+  server_cfg.num_bind_hosts = 1;
+  server_cfg.port = 9999;
+  server_cfg.cert_file = "t/assets/server.crt";
+  server_cfg.key_file = "t/assets/server.key";
+  server_cfg.callback = on_server_event;
+  server_cfg.user_data = &server_state;
+
+  /* create client transport config */
+  transport_config_t client_cfg = {0};
+  client_cfg.bind_hosts[0] = "127.0.0.1";
+  client_cfg.num_bind_hosts = 1;
+  client_cfg.remote_hosts[0] = "127.0.0.1";
+  client_cfg.num_remote_hosts = 1;
+  client_cfg.port = 9999;
+  client_cfg.cert_file = NULL;
+  client_cfg.key_file = NULL;
+  client_cfg.callback = on_client_event;
+  client_cfg.user_data = &client_state;
+
+  printf("creating server and client transports...\n");
+  transport_t *server = transport_create(&server_cfg);
+  if (!server) {
+    fprintf(stderr, "failed to create server transport\n");
+    return 1;
+  }
+  server_state.transport = server;
+
+  transport_t *client = transport_create(&client_cfg);
+  if (!client) {
+    fprintf(stderr, "failed to create client transport\n");
+    transport_destroy(server);
+    return 1;
+  }
+  client_state.transport = client;
+
+  /* wait for connection */
+  printf("connecting...\n");
+  int retries = 100;
+  while (retries-- > 0 &&
+         (!server_state.connected || !client_state.connected)) {
+    transport_tick(server);
+    transport_tick(client);
+    usleep(10 * 1000);
+  }
+
+  if (!server_state.connected || !client_state.connected) {
+    fprintf(stderr, "failed to establish connection\n");
+    transport_destroy(client);
+    transport_destroy(server);
+    return 1;
+  }
+
+  /* client subscribes to the catalog track */
+  printf("subscribing to catalog track...\n");
+  moq_track_id_t t_catalog = {.type = MOQ_TRACK_TEXT,
+                              .flags = MOQ_TRACK_FLAG_RELIABLE,
+                              .name = "catalog"};
+  if (!transport_subscribe(client, t_catalog)) {
+    fprintf(stderr, "failed to subscribe to catalog\n");
+    transport_destroy(client);
+    transport_destroy(server);
+    return 1;
+  }
+
+  /* wait for client to receive catalog, parse it, and subscribe to video track
+   */
+  retries = 200;
+  while (retries-- > 0 && !server_state.subscribed) {
+    transport_tick(server);
+    transport_tick(client);
+    usleep(10 * 1000);
+  }
+
+  if (!server_state.subscribed) {
+    fprintf(stderr,
+            "server did not receive dynamic video_track subscribe event\n");
+    transport_destroy(client);
+    transport_destroy(server);
+    return 1;
+  }
+
+  /* server publishes test media frame on the dynamically discovered track */
+  printf("publishing video frame on dynamically discovered track...\n");
+  const char *payload = "hello sleepy bishop!";
+  moq_object_t obj = {.track_id = {.type = MOQ_TRACK_VIDEO,
+                                   .flags = MOQ_TRACK_FLAG_FEC_ENABLED,
+                                   .name = "video_track"},
+                      .group_id = 42,
+                      .object_id = 1,
+                      .data = (const uint8_t *)payload,
+                      .size = strlen(payload),
+                      .is_keyframe = true};
+
+  if (!transport_publish(server, &obj)) {
+    fprintf(stderr, "failed to publish object\n");
+    transport_destroy(client);
+    transport_destroy(server);
+    return 1;
+  }
+
+  retries = 100;
+  while (retries-- > 0 && !client_state.object_received) {
+    transport_tick(server);
+    transport_tick(client);
+    usleep(10 * 1000);
+  }
+
+  if (!client_state.object_received) {
+    fprintf(stderr,
+            "client did not receive published object on dynamic track\n");
+    transport_destroy(client);
+    transport_destroy(server);
+    return 1;
+  }
+
+  /* verify packet payloads */
+  if (strcmp((char *)client_state.received_data, payload) != 0) {
+    fprintf(stderr, "payload verification failed\n");
+    transport_destroy(client);
+    transport_destroy(server);
+    return 1;
+  }
+
+  printf("===TRANSPORT OK===\n");
+
+  transport_destroy(client);
+  transport_destroy(server);
+  return 0;
+}
