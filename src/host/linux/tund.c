@@ -21,6 +21,7 @@
 #else
 #include <net/if.h>
 #endif
+#include "transport.h"
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/uio.h>
@@ -37,6 +38,7 @@ static char socket_name[128] = "bishlink-data";
 static char ip_addr[64] = "10.8.0.1/24";
 static uint8_t tund_priority = 1;
 static char track_name[64] = "";
+static bool use_reliable = false;
 
 #ifdef __APPLE__
 static int tun_create_by_id(char if_name[IFNAMSIZ], unsigned int id) {
@@ -278,8 +280,8 @@ static void configure_ip_and_up(const char *if_name, const char *ip_cidr) {
 
   char cmd[512];
 #if defined(__linux__)
-  snprintf(cmd, sizeof(cmd), "ip addr add %s dev %s 2>/dev/null", ip_cidr,
-           if_name);
+  snprintf(cmd, sizeof(cmd), "ip addr add %s peer %s dev %s 2>/dev/null", ip,
+           peer_ip, if_name);
   if (system(cmd) != 0) {
   }
   snprintf(cmd, sizeof(cmd), "ip link set dev %s up 2>/dev/null", if_name);
@@ -326,7 +328,14 @@ int main(int argc, char **argv) {
                 strcmp(argv[i], "-t") == 0) &&
                i + 1 < argc) {
       strncpy(track_name, argv[++i], sizeof(track_name) - 1);
+    } else if (strcmp(argv[i], "--reliable") == 0 ||
+               strcmp(argv[i], "-r") == 0) {
+      use_reliable = true;
     }
+  }
+
+  if (strlen(track_name) == 0) {
+    snprintf(track_name, sizeof(track_name), "tund/%s", dev_name);
   }
 
   printf(
@@ -367,11 +376,13 @@ int main(int argc, char **argv) {
           usleep(500 * 1000);
           continue;
         }
-        uint8_t reg_hdr[2];
-        reg_hdr[0] = 4; /* MOQ_TRACK_DATA */
-        reg_hdr[1] = (uint8_t)strlen(track_name);
-        if (write(uds_fd, reg_hdr, 2) != 2 ||
-            write(uds_fd, track_name, reg_hdr[1]) != (ssize_t)reg_hdr[1]) {
+        uint8_t reg_hdr[3];
+        reg_hdr[0] = MOQ_TRACK_DATA;
+        reg_hdr[1] =
+            use_reliable ? MOQ_TRACK_FLAG_RELIABLE : MOQ_TRACK_FLAG_FEC_ENABLED;
+        reg_hdr[2] = (uint8_t)strlen(track_name);
+        if (write(uds_fd, reg_hdr, 3) != 3 ||
+            write(uds_fd, track_name, reg_hdr[2]) != (ssize_t)reg_hdr[2]) {
           close(uds_fd);
           uds_fd = -1;
           usleep(500 * 1000);
@@ -525,6 +536,9 @@ int main(int argc, char **argv) {
           if (wret < 0) {
             if (errno == EINTR)
               continue;
+            fprintf(stderr,
+                    "tund: tun_write failed, len=%u, error: %s (errno=%d)\n",
+                    pkt_len, strerror(errno), errno);
           }
           break;
         }

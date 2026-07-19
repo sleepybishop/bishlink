@@ -30,3 +30,7 @@ cmake_install.cmake
 
 # Documentation
 doc/
+host_helpers/
+
+# Logs
+logs/

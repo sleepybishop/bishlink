@@ -3,22 +3,22 @@
 #include "fec.h"
 #include "ifmon.h"
 #include "pathflow.h"
+#include "portable_sockets.h"
 #include "transport.h"
-#include <arpa/inet.h>
 #include <endian.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
 #include <linux/errqueue.h>
-#include <netinet/in.h>
 #include <openssl/pem.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <sys/un.h>
 #include <time.h>
-#include <unistd.h>
+#ifndef _WIN32
+#include <net/if.h>
+#endif
 
 #include "pathflow.h"
 #include "picotls.h"
@@ -162,6 +162,17 @@ struct transport_t {
 
   /* pre-allocated transport memory arena */
   arena_t arena;
+
+  /* FEC Packet Grouping Buffer */
+  uint8_t *fec_buf;
+  size_t fec_buf_len;
+  size_t fec_buf_cap;
+  uint64_t fec_first_pkt_time;
+  moq_track_id_t fec_track_id;
+  uint32_t fec_object_id;
+  uint32_t fec_pkt_count;
+  uint8_t fec_priority;
+  bool fec_in_flush;
 
   /* ifmon integration */
   ifmon_watcher_t ifmon_w;
@@ -531,6 +542,8 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
 
       moq_track_id_t resolved_track = {0};
       if (find_subscription_by_alias(conn, alias, &resolved_track) == 0) {
+        resolved_track.flags &= ~MOQ_TRACK_FLAG_FEC_ENABLED;
+        resolved_track.flags |= MOQ_TRACK_FLAG_RELIABLE;
         transport_event_t ev = {.type = TRANSPORT_EVENT_OBJECT,
                                 .conn = conn,
                                 .track_id = resolved_track,
@@ -615,7 +628,9 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
           }
 
           if (parity_symbols > 0) {
-            fec_t *fec = get_cached_fec(t, FEC_RAPTORQ, data_symbols,
+            fec_type_t fec_type =
+                (total_symbols > 255) ? FEC_RAPTORQ : FEC_REED_SOLOMON;
+            fec_t *fec = get_cached_fec(t, fec_type, data_symbols,
                                         parity_symbols, symbol_size);
             if (fec) {
               fec_encode(fec, (const uint8_t *const *)data_blocks,
@@ -1050,9 +1065,10 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
     } else {
       size_t parity_symbols = total_symbols - data_symbols;
       if (parity_symbols > 0) {
-        fec_type_t fec_type = (resolved_track.type == MOQ_TRACK_DATA)
-                                  ? FEC_RAPTORQ
-                                  : FEC_REED_SOLOMON;
+        fec_type_t fec_type =
+            (resolved_track.type == MOQ_TRACK_DATA && total_symbols > 255)
+                ? FEC_RAPTORQ
+                : FEC_REED_SOLOMON;
         fec_t *fec = get_cached_fec(t, fec_type, data_symbols, parity_symbols,
                                     symbol_size);
         if (fec) {
@@ -1077,6 +1093,8 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
         }
       }
 
+      resolved_track.flags |= MOQ_TRACK_FLAG_FEC_ENABLED;
+      resolved_track.flags &= ~MOQ_TRACK_FLAG_RELIABLE;
       transport_event_t ev = {.type = TRANSPORT_EVENT_OBJECT,
                               .conn = tconn,
                               .track_id = resolved_track,
@@ -1126,6 +1144,35 @@ typedef struct {
   socklen_t addr_len;
   int is_added;
 } ifmon_pipe_msg_t;
+
+static void bind_to_device(int fd, uint32_t index) {
+  if (index == 0)
+    return;
+#if defined(__linux__)
+  char ifname[IF_NAMESIZE];
+  if (if_indextoname(index, ifname)) {
+    if (strncmp(ifname, "veth", 4) == 0)
+      return;
+    setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, ifname, strlen(ifname));
+  }
+#elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) ||    \
+    defined(__NetBSD__)
+#ifndef IP_BOUND_IF
+#define IP_BOUND_IF 25
+#endif
+#ifndef IPV6_BOUND_IF
+#define IPV6_BOUND_IF 125
+#endif
+  unsigned int idx = index;
+  setsockopt(fd, IPPROTO_IP, IP_BOUND_IF, &idx, sizeof(idx));
+  setsockopt(fd, IPPROTO_IPV6, IPV6_BOUND_IF, &idx, sizeof(idx));
+#elif defined(_WIN32)
+  DWORD idx = index;
+  setsockopt(fd, IPPROTO_IP, IP_UNICAST_IF, (const char *)&idx, sizeof(idx));
+  setsockopt(fd, IPPROTO_IPV6, IPV6_UNICAST_IF, (const char *)&idx,
+             sizeof(idx));
+#endif
+}
 
 static void on_ifmon_update(const ifmon_update_t *update, void *userdata) {
   transport_t *t = userdata;
@@ -1360,13 +1407,13 @@ void transport_destroy(transport_t *t) {
     ifmon_watch_stop(&t->ifmon_w);
   }
   if (t->ifmon_pipe[0] >= 0) {
-    close(t->ifmon_pipe[0]);
-    close(t->ifmon_pipe[1]);
+    CLOSE_SOCKET(t->ifmon_pipe[0]);
+    CLOSE_SOCKET(t->ifmon_pipe[1]);
   }
 
   for (size_t i = 0; i < t->num_fds; i++) {
     if (t->fds[i] >= 0) {
-      close(t->fds[i]);
+      CLOSE_SOCKET(t->fds[i]);
     }
   }
 
@@ -1425,12 +1472,26 @@ void transport_destroy(transport_t *t) {
     quicly_free_default_cid_encryptor(t->quic_ctx.cid_encryptor);
   }
 
+  if (t->fec_buf) {
+    free(t->fec_buf);
+  }
+
   free(t);
 }
+
+static void flush_fec_buffer(transport_t *t);
 
 void transport_tick(transport_t *t) {
   if (!t)
     return;
+
+  /* Check for FEC grouping buffer timeout (3 milliseconds) */
+  if (t->fec_buf_len > 0) {
+    uint64_t now = ptls_get_time.cb(&ptls_get_time);
+    if ((now - t->fec_first_pkt_time) >= 3) {
+      flush_fec_buffer(t);
+    }
+  }
 
   /* process ifmon events */
   if (t->ifmon_pipe[0] >= 0) {
@@ -1477,6 +1538,7 @@ void transport_tick(transport_t *t) {
             if (bind(fd, (struct sockaddr *)&msg.addr, msg.addr_len) == 0) {
               int flags = fcntl(fd, F_GETFL, 0);
               fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+              bind_to_device(fd, msg.index);
 
               t->fds[t->num_fds] = fd;
               t->local_addrs[t->num_fds] = msg.addr;
@@ -1516,7 +1578,7 @@ void transport_tick(transport_t *t) {
                 }
               }
             } else {
-              close(fd);
+              CLOSE_SOCKET(fd);
             }
           }
         }
@@ -1539,7 +1601,7 @@ void transport_tick(transport_t *t) {
                 match = 1;
             }
             if (match) {
-              close(t->fds[i]);
+              CLOSE_SOCKET(t->fds[i]);
               /* remove from array */
               for (size_t j = i; j < t->num_fds - 1; j++) {
                 t->fds[j] = t->fds[j + 1];
@@ -1560,14 +1622,12 @@ void transport_tick(transport_t *t) {
     while (1) {
       uint8_t buf[2048];
       struct sockaddr_storage sa;
-      struct iovec vec = {.iov_base = buf, .iov_len = sizeof(buf)};
-      struct msghdr msg = {.msg_name = &sa,
-                           .msg_namelen = sizeof(sa),
-                           .msg_iov = &vec,
-                           .msg_iovlen = 1};
-      ssize_t rret = recvmsg(t->fds[fd_idx], &msg, 0);
+      socklen_t sa_len = sizeof(sa);
+      ssize_t rret = recvfrom(t->fds[fd_idx], buf, sizeof(buf), 0,
+                              (struct sockaddr *)&sa, &sa_len);
       if (rret == -1) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK)
+        if (SOCKET_ERROR_CODE == SOCKET_EAGAIN ||
+            SOCKET_ERROR_CODE == SOCKET_EWOULDBLOCK)
           break;
         continue;
       }
@@ -1742,9 +1802,11 @@ void transport_tick(transport_t *t) {
           }
 
           ssize_t sret;
-          while ((sret = sendmsg(out_fd, &mess, 0)) == -1 && errno == EINTR)
+          while ((sret = sendto(out_fd, dgrams[j].iov_base, dgrams[j].iov_len,
+                                0, mess.msg_name, mess.msg_namelen)) == -1 &&
+                 SOCKET_ERROR_CODE == SOCKET_EINTR)
             ;
-          if (sret == -1) {
+          if (sret == -1 && errno != EAGAIN && errno != EWOULDBLOCK) {
             fprintf(stderr, "sendmsg failed: %s (errno=%d)\n", strerror(errno),
                     errno);
           }
@@ -1800,9 +1862,106 @@ static track_delivery_profile_t get_track_profile(const moq_track_id_t *track) {
   return profile;
 }
 
+static void flush_fec_buffer(transport_t *t) {
+  if (t->fec_buf_len == 0)
+    return;
+
+  moq_object_t obj = {.track_id = t->fec_track_id,
+                      .group_id = 0,
+                      .object_id = t->fec_object_id++,
+                      .data = t->fec_buf,
+                      .size = t->fec_buf_len,
+                      .is_keyframe = false,
+                      .priority = t->fec_priority};
+
+  t->fec_in_flush = true;
+  transport_publish(t, &obj);
+  t->fec_in_flush = false;
+
+  t->fec_buf_len = 0;
+  t->fec_first_pkt_time = 0;
+  t->fec_pkt_count = 0;
+}
+
 bool transport_publish(transport_t *t, const moq_object_t *obj) {
   if (!t)
     return false;
+
+  /* route to grouping buffer if it's data and we're not flushing */
+  if (obj->track_id.type == MOQ_TRACK_DATA && !t->fec_in_flush) {
+    bool use_fec = false;
+    if (t->is_server) {
+      for (size_t c = 0; c < t->conn_count; c++) {
+        transport_conn_t *conn = t->conns[c];
+        if (conn && conn->quic &&
+            quicly_get_state(conn->quic) < QUICLY_STATE_CLOSING) {
+          for (int s = 0; s < 32; s++) {
+            if (conn->subscriptions[s].active &&
+                conn->subscriptions[s].track_id.type == obj->track_id.type &&
+                strcmp(conn->subscriptions[s].track_id.name,
+                       obj->track_id.name) == 0) {
+              track_delivery_profile_t profile =
+                  get_track_profile(&conn->subscriptions[s].track_id);
+              if (profile.fec_enabled) {
+                use_fec = true;
+                break;
+              }
+            }
+          }
+          if (use_fec)
+            break;
+        }
+      }
+    } else if (t->client_conn) {
+      transport_conn_t *conn = t->client_conn;
+      for (int s = 0; s < 32; s++) {
+        if (conn->subscriptions[s].active &&
+            conn->subscriptions[s].track_id.type == obj->track_id.type &&
+            strcmp(conn->subscriptions[s].track_id.name, obj->track_id.name) ==
+                0) {
+          track_delivery_profile_t profile =
+              get_track_profile(&conn->subscriptions[s].track_id);
+          if (profile.fec_enabled) {
+            use_fec = true;
+            break;
+          }
+        }
+      }
+    }
+
+    if (use_fec) {
+      uint64_t now = ptls_get_time.cb(&ptls_get_time);
+      if (t->fec_buf_len == 0) {
+        t->fec_first_pkt_time = now;
+        t->fec_track_id = obj->track_id;
+        t->fec_priority = obj->priority;
+      }
+
+      size_t needed = t->fec_buf_len + 2 + obj->size;
+      if (needed > t->fec_buf_cap) {
+        size_t new_cap = t->fec_buf_cap == 0 ? 4096 : t->fec_buf_cap * 2;
+        while (new_cap < needed)
+          new_cap *= 2;
+        uint8_t *new_buf = realloc(t->fec_buf, new_cap);
+        if (!new_buf) {
+          return false;
+        }
+        t->fec_buf = new_buf;
+        t->fec_buf_cap = new_cap;
+      }
+
+      uint16_t len_be = htons((uint16_t)obj->size);
+      memcpy(t->fec_buf + t->fec_buf_len, &len_be, 2);
+      memcpy(t->fec_buf + t->fec_buf_len + 2, obj->data, obj->size);
+      t->fec_buf_len = needed;
+      t->fec_pkt_count++;
+
+      if (t->fec_pkt_count >= 4 || t->fec_buf_len >= 4000) {
+        flush_fec_buffer(t);
+      }
+      return true;
+    }
+  }
 
   track_delivery_profile_t profile = get_track_profile(&obj->track_id);
 
@@ -2015,6 +2174,9 @@ bool transport_publish(transport_t *t, const moq_object_t *obj) {
   }
 
   if (parity_symbols > 0) {
+    if (fec_type == FEC_RAPTORQ && (data_symbols + parity_symbols) <= 255) {
+      fec_type = FEC_REED_SOLOMON;
+    }
     fec_t *fec =
         get_cached_fec(t, fec_type, data_symbols, parity_symbols, symbol_size);
     if (fec) {
@@ -2103,9 +2265,49 @@ bool transport_publish(transport_t *t, const moq_object_t *obj) {
 }
 
 bool transport_subscribe(transport_t *t, moq_track_id_t track_id) {
-  if (!t || t->is_server || !t->client_conn || !t->client_conn->stream ||
-      !quicly_sendstate_is_open(&t->client_conn->stream->sendstate))
+  if (!t)
     return false;
+
+  if (t->is_server) {
+    for (size_t i = 0; i < t->conn_count; i++) {
+      transport_conn_t *conn = t->conns[i];
+      if (!conn || !conn->stream ||
+          !quicly_sendstate_is_open(&conn->stream->sendstate))
+        continue;
+
+      uint8_t alias;
+      if (find_alias_by_track(conn, &track_id, &alias) != 0) {
+        if (track_id.name[0] == '\0') {
+          alias = (uint8_t)track_id.type;
+        } else {
+          int next_alias = 8;
+          for (int j = 0; j < 32; j++) {
+            if (conn->subscriptions[j].active &&
+                conn->subscriptions[j].alias >= next_alias) {
+              next_alias = conn->subscriptions[j].alias + 1;
+            }
+          }
+          alias = (uint8_t)next_alias;
+        }
+        add_subscription(conn, track_id.type, track_id.flags, track_id.name,
+                         alias);
+      }
+
+      uint8_t name_len = (uint8_t)strlen(track_id.name);
+      uint8_t msg_hdr[5] = {0x01, alias, (uint8_t)track_id.type, track_id.flags,
+                            name_len};
+      quicly_streambuf_egress_write(conn->stream, msg_hdr, 5);
+      if (name_len > 0) {
+        quicly_streambuf_egress_write(conn->stream, track_id.name, name_len);
+      }
+    }
+    return true;
+  }
+
+  if (!t->client_conn || !t->client_conn->stream ||
+      !quicly_sendstate_is_open(&t->client_conn->stream->sendstate)) {
+    return false;
+  }
 
   uint8_t alias;
   if (find_alias_by_track(t->client_conn, &track_id, &alias) != 0) {
@@ -2154,7 +2356,8 @@ bool transport_request_keyframe(transport_t *t, moq_track_id_t track_id) {
 
 bool transport_send_unicast(transport_t *t, transport_conn_t *conn,
                             const void *data, size_t size) {
-  (void)t;
+  if (!t)
+    return false;
   if (!conn || !conn->stream ||
       !quicly_sendstate_is_open(&conn->stream->sendstate))
     return false;
@@ -2170,7 +2373,8 @@ bool transport_send_unicast(transport_t *t, transport_conn_t *conn,
 }
 
 void transport_close_conn(transport_t *t, transport_conn_t *conn) {
-  (void)t;
+  if (!t)
+    return;
   if (conn && conn->quic) {
     quicly_close(conn->quic, 0, "");
   }
@@ -2178,7 +2382,8 @@ void transport_close_conn(transport_t *t, transport_conn_t *conn) {
 
 bool transport_send_auth(transport_t *t, transport_conn_t *conn,
                          const uint8_t *token, size_t token_len) {
-  (void)t;
+  if (!t)
+    return false;
   if (!conn || !conn->stream ||
       !quicly_sendstate_is_open(&conn->stream->sendstate))
     return false;
@@ -2199,7 +2404,8 @@ bool transport_send_auth(transport_t *t, transport_conn_t *conn,
 
 bool transport_respond_auth(transport_t *t, transport_conn_t *conn,
                             bool success) {
-  (void)t;
+  if (!t)
+    return false;
   if (!conn || !conn->stream ||
       !quicly_sendstate_is_open(&conn->stream->sendstate))
     return false;
@@ -2220,13 +2426,15 @@ uint64_t transport_get_estimated_bandwidth(transport_t *t) {
     return 0;
   transport_conn_t *conn =
       t->is_server ? (t->conn_count > 0 ? t->conns[0] : NULL) : t->client_conn;
-  if (!conn || !conn->quic)
+  if (!conn || !conn->quic) {
     return 0;
-  quicly_stats_t stats;
-  if (quicly_get_stats(conn->quic, &stats) == 0) {
-    return stats.delivery_rate.latest;
   }
-  return 0;
+  quicly_stats_t stats;
+  uint64_t rate = 0;
+  if (quicly_get_stats(conn->quic, &stats) == 0) {
+    rate = stats.delivery_rate.latest;
+  }
+  return rate;
 }
 
 int transport_enable_qlog(const char *socket_path) {
@@ -2240,7 +2448,7 @@ int transport_enable_qlog(const char *socket_path) {
   strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
 
   if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-    close(fd);
+    CLOSE_SOCKET(fd);
     return -1;
   }
 
@@ -2318,4 +2526,56 @@ void transport_mock_iface_add(transport_t *t, const char *ip_addr) {
 
   ssize_t w = write(t->ifmon_pipe[1], &msg, sizeof(msg));
   (void)w;
+}
+
+bool transport_is_track_ready(transport_t *t, const moq_track_id_t *track_id) {
+  if (!t)
+    return false;
+
+  track_delivery_profile_t profile = get_track_profile(track_id);
+
+  size_t active_count = t->is_server ? t->conn_count : (t->client_conn ? 1 : 0);
+  if (active_count == 0)
+    return true; /* no peers means data is dropped anyway, so it's "ready" */
+
+  bool all_ready = true;
+  for (size_t c = 0; c < active_count; c++) {
+    transport_conn_t *conn = t->is_server ? t->conns[c] : t->client_conn;
+    if (!conn || !conn->quic ||
+        quicly_get_state(conn->quic) >= QUICLY_STATE_CLOSING)
+      continue;
+
+    if (t->is_server && !is_subscribed(conn, track_id))
+      continue;
+
+    if (profile.reliable) {
+      quicly_stream_t *stream = NULL;
+      for (int i = 0; i < 32; i++) {
+        if (conn->subscriptions[i].active &&
+            conn->subscriptions[i].track_id.type == track_id->type &&
+            strcmp(conn->subscriptions[i].track_id.name, track_id->name) == 0) {
+          stream = conn->subscriptions[i].stream;
+          break;
+        }
+      }
+
+      if (stream) {
+        quicly_streambuf_t *sbuf = (quicly_streambuf_t *)stream->data;
+        if (sbuf && sbuf->egress.vecs.size > 256) {
+          all_ready = false;
+          break;
+        }
+      }
+    } else {
+      quicly_path_stats_t pstats;
+      if (quicly_get_path_stats(conn->quic, 0, &pstats) == 0) {
+        if (pstats.bytes_in_flight >= pstats.cwnd * 2) {
+          all_ready = false;
+          break;
+        }
+      }
+    }
+  }
+
+  return all_ready;
 }

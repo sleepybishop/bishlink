@@ -145,4 +145,7 @@ bool transport_get_path_stats(transport_t *t, size_t path_idx,
 /* mock a local IP interface addition for testing multipath */
 void transport_mock_iface_add(transport_t *t, const char *ip_addr);
 
+/* check if a track is ready for more data (application-layer backpressure) */
+bool transport_is_track_ready(transport_t *t, const moq_track_id_t *track_id);
+
 #endif /* TRANSPORT_H */

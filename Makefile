@@ -61,13 +61,7 @@ COMMON_OBJS = src/common/data_uds.o \
               $(PATHFLOW_OBJS) \
               $(IFMON_OBJS)
 
-HOST_OBJS = src/host/main.o \
-            src/host/linux/capture_x11.o \
-            src/host/linux/audio_pulse.o \
-            src/host/linux/inject_uinput.o \
-            $(COMMON_OBJS)
-
-CLIENT_OBJS = src/client/main.o \
+DAEMON_OBJS = src/daemon/main.o \
               $(COMMON_OBJS)
 
 FEC_OBJS = src/common/fec.o \
@@ -76,13 +70,6 @@ FEC_OBJS = src/common/fec.o \
            deps/nanors/deps/obl/oblas_lite.o \
            $(NANORQ_OBJS) \
            $(PATHFLOW_OBJS)
-
-# Target-specific includes for host-related code
-t/00util/test_uds.o: INCLUDES += -Isrc/host
-src/host/linux/capture_x11.o: INCLUDES += -Isrc/host
-src/host/linux/inject_uinput.o: INCLUDES += -Isrc/host
-src/host/linux/audio_pulse.o: INCLUDES += -Isrc/host
-src/host/main.o: INCLUDES += -Isrc/host
 
 # Rules to compile our source files with full warnings
 src/%.o: src/%.c
@@ -98,53 +85,26 @@ t/%.o: t/%.c
 deps/%.o: deps/%.c
 	$(CC) $(INCLUDES) $(CFLAGS) -w -c $< -o $@
 
-all: patch-quicly bishlink-host bishlink-client bishlink-inputd bishlink-videod bishlink-audiod bishlink-tund
+all: patch-quicly bishlinkd bishlink-tund
 
 patch-quicly:
 
 unpatch-quicly:
 
-bishlink-host: patch-quicly $(HOST_OBJS)
-	$(CC) -o $@ $(HOST_OBJS) $(LDFLAGS)
-
-bishlink-client: patch-quicly $(CLIENT_OBJS)
-	$(CC) -o $@ $(CLIENT_OBJS) $(LDFLAGS)
-
-bishlink-inputd: src/host/linux/inputd.c src/common/input_event.h
-	$(CC) $(CFLAGS_COMMON) $(INCLUDES) -o $@ src/host/linux/inputd.c
-
-bishlink-videod: src/host/linux/videod.c
-	$(CC) $(CFLAGS_COMMON) $(INCLUDES) -o $@ src/host/linux/videod.c -lX11 -lXext
-
-bishlink-audiod: src/host/linux/audiod.c
-	$(CC) $(CFLAGS_COMMON) $(INCLUDES) -o $@ src/host/linux/audiod.c -lpulse-simple -lpulse -lm
+bishlinkd: patch-quicly $(DAEMON_OBJS)
+	$(CC) -o $@ $(DAEMON_OBJS) $(LDFLAGS)
 
 bishlink-tund: src/host/linux/tund.c
 	$(CC) $(CFLAGS_COMMON) $(INCLUDES) -o $@ src/host/linux/tund.c
+
+examples/data_multipath_benchmark: patch-quicly examples/data_multipath_benchmark.o $(COMMON_OBJS)
+	$(CC) -o $@ examples/data_multipath_benchmark.o $(COMMON_OBJS) $(LDFLAGS)
 
 t/00util/test_fec: t/00util/test_fec.o $(FEC_OBJS)
 	$(CC) -o $@ t/00util/test_fec.o $(FEC_OBJS) $(LDFLAGS)
 
 t/00util/test_transport: patch-quicly t/00util/test_transport.o $(COMMON_OBJS)
 	$(CC) -o $@ t/00util/test_transport.o $(COMMON_OBJS) $(LDFLAGS)
-
-examples/video_latency_benchmark: patch-quicly examples/video_latency_benchmark.o $(COMMON_OBJS)
-	$(CC) -o $@ examples/video_latency_benchmark.o $(COMMON_OBJS) $(LDFLAGS)
-
-t/00util/test_uds: t/00util/test_uds.o src/host/linux/capture_x11.o src/host/linux/inject_uinput.o
-	$(CC) $(CFLAGS_COMMON) $(INCLUDES) -Isrc/host -o $@ t/00util/test_uds.o src/host/linux/capture_x11.o src/host/linux/inject_uinput.o $(LDFLAGS)
-
-t/00util/test_audio: patch-quicly t/00util/test_audio.o $(COMMON_OBJS)
-	$(CC) -o $@ t/00util/test_audio.o $(COMMON_OBJS) $(LDFLAGS)
-
-t/00util/test_inputd: t/00util/test_inputd.c src/common/input_event.h
-	$(CC) $(CFLAGS_COMMON) $(INCLUDES) -o $@ t/00util/test_inputd.c
-
-t/00util/test_videod: t/00util/test_videod.c
-	$(CC) $(CFLAGS_COMMON) $(INCLUDES) -o $@ t/00util/test_videod.c
-
-t/00util/test_audiod: t/00util/test_audiod.c
-	$(CC) $(CFLAGS_COMMON) $(INCLUDES) -o $@ t/00util/test_audiod.c
 
 t/00util/test_tund: patch-quicly t/00util/test_tund.o $(COMMON_OBJS)
 	$(CC) -o $@ t/00util/test_tund.o $(COMMON_OBJS) $(LDFLAGS)
@@ -162,13 +122,19 @@ benchmark: t/00util/test_benchmark
 	./t/00util/test_benchmark
 
 clean: unpatch-quicly
-	rm -f bishlink-host bishlink-client bishlink-inputd bishlink-videod bishlink-audiod bishlink-tund t/00util/test_fec t/00util/test_transport t/00util/test_uds t/00util/test_audio t/00util/test_inputd t/00util/test_videod t/00util/test_audiod t/00util/test_tund t/00util/test_multipath t/00util/test_benchmark t/00util/test_tc_benchmark examples/video_latency_benchmark
+	rm -f bishlinkd bishlink-tund t/00util/test_fec t/00util/test_transport t/00util/test_tund t/00util/test_multipath t/00util/test_benchmark t/00util/test_tc_benchmark examples/data_multipath_benchmark
 	find src deps t examples -name "*.o" -delete
 
-check: patch-quicly bishlink-inputd bishlink-videod bishlink-audiod bishlink-tund t/00util/test_fec t/00util/test_transport t/00util/test_uds t/00util/test_audio t/00util/test_inputd t/00util/test_videod t/00util/test_audiod t/00util/test_tund t/00util/test_multipath
+check: patch-quicly bishlink-tund t/00util/test_fec t/00util/test_transport t/00util/test_tund t/00util/test_multipath gencerts
 	prove -I. -v t/*.t
 
-indent:
-	clang-format -style=LLVM -i src/common/*.c src/common/*.h src/host/*.c src/host/linux/*.c src/client/*.c examples/*.c t/00util/*.c
+t/assets/server.crt t/assets/server.key:
+	mkdir -p t/assets
+	openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout t/assets/server.key -out t/assets/server.crt -subj "/CN=localhost"
 
-.PHONY: all clean check patch-quicly unpatch-quicly benchmark indent
+gencerts: t/assets/server.crt t/assets/server.key
+
+indent:
+	clang-format -style=LLVM -i src/common/*.c src/common/*.h src/host/linux/*.c examples/*.c t/00util/*.c
+
+.PHONY: all clean check patch-quicly unpatch-quicly benchmark indent gencerts

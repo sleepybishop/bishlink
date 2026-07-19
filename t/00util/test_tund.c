@@ -6,6 +6,7 @@
 
 #include "data_uds.h"
 #include "transport.h"
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -63,13 +64,27 @@ static void on_quic_event(void *user_data, const transport_event_t *event) {
     if (!ctx->is_server && event->auth.success) {
       moq_track_id_t t_data = {.type = MOQ_TRACK_DATA,
                                .flags = MOQ_TRACK_FLAG_FEC_ENABLED};
+      strcpy(t_data.name, "test-track");
       transport_subscribe(ctx->transport, t_data);
     }
     break;
   case TRANSPORT_EVENT_OBJECT:
     if (event->track_id.type == MOQ_TRACK_DATA && ctx->data_pipe) {
-      data_uds_send(ctx->data_pipe, &event->track_id, event->object.data,
-                    event->object.size, event->object.priority);
+      /* Unpack length-prefixed packets */
+      const uint8_t *ptr = event->object.data;
+      size_t remaining = event->object.size;
+      while (remaining >= 2) {
+        uint16_t pkt_len;
+        memcpy(&pkt_len, ptr, 2);
+        pkt_len = ntohs(pkt_len);
+        if (remaining < 2 + (size_t)pkt_len) {
+          break;
+        }
+        data_uds_send(ctx->data_pipe, &event->track_id, ptr + 2, pkt_len,
+                      event->object.priority);
+        ptr += 2 + pkt_len;
+        remaining -= 2 + pkt_len;
+      }
     }
     break;
   default:
@@ -125,9 +140,9 @@ int main(void) {
 
   /* 3. setup UDS data pipes */
   server_ctx.data_pipe =
-      data_uds_create("bishlink-data", on_uds_packet, &server_ctx);
+      data_uds_create("bishlink-data", on_uds_packet, NULL, &server_ctx);
   client_ctx.data_pipe =
-      data_uds_create("bishlink-data-client", on_uds_packet, &client_ctx);
+      data_uds_create("bishlink-data-client", on_uds_packet, NULL, &client_ctx);
 
   /* 4. loop transport ticks until connected and subscribed */
   printf("connecting loopback QUIC sockets...\n");
@@ -148,17 +163,10 @@ int main(void) {
     dup2(log_fd, STDOUT_FILENO);
     close(log_fd);
 
-    char *args[] = {"./bishlink-tund",
-                    "--mock",
-                    "--socket",
-                    "bishlink-data",
-                    "-i",
-                    "tun-host",
-                    "-a",
-                    "10.8.0.1/24",
-                    "--priority",
-                    "high",
-                    NULL};
+    char *args[] = {
+        "./bishlink-tund", "--mock",     "--socket",    "bishlink-data", "-i",
+        "tun-host",        "-a",         "10.8.0.1/24", "--priority",    "high",
+        "--track",         "test-track", NULL};
     execv(args[0], args);
     exit(1);
   }
@@ -180,6 +188,8 @@ int main(void) {
                     "10.8.0.2/24",
                     "--priority",
                     "low",
+                    "--track",
+                    "test-track",
                     NULL};
     execv(args[0], args);
     exit(1);
@@ -188,6 +198,8 @@ int main(void) {
   /* 6. run traffic loop for 1.5 seconds */
   printf("running traffic loop for bidirectional mock tunnel...\n");
   for (int i = 0; i < 150; i++) {
+    data_uds_tick(server_ctx.data_pipe);
+    data_uds_tick(client_ctx.data_pipe);
     transport_tick(server_ctx.transport);
     transport_tick(client_ctx.transport);
     usleep(10 * 1000);
